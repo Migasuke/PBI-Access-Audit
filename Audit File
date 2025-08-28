@@ -1,0 +1,246 @@
+import sempy.fabric as fabric
+import pandas as pd
+
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.sql.functions import current_date, lit
+
+
+
+#Instantiate the client
+client = fabric.FabricRestClient()
+
+
+#############################################
+# Getting Workspaces
+
+# Make API call
+url_workspace = "https://api.powerbi.com/v1.0/myorg/groups"
+response = client.get(url_workspace)
+
+# Normalize JSON
+response_workspaces =  pd.json_normalize(response.json()['value'])
+
+# Define schema
+schema_workspaces = StructType([
+    StructField("id", StringType(), True),
+    StructField("name", StringType(), True),
+    StructField("isReadOnly", StringType(), True),
+    StructField("isOnDedicatedCapacity", StringType(), True)
+])
+
+
+# Create Spark DataFrame
+df_workspaces = spark.createDataFrame(response_workspaces[["id", "name" , "isReadOnly", "isOnDedicatedCapacity"]], schema=schema_workspaces)
+display(df_workspaces)
+
+# Collect group IDs into a list
+group_ids = [row.id for row in df_workspaces.collect()]
+
+
+
+#############################################
+# Defying function workspaces_users_api
+
+def workspaces_users_api(group_id):
+   
+    # Make API call
+    url_group_users = f"https://api.powerbi.com/v1.0/myorg/groups/{group_id}/users"
+    response_group_users = client.get(url_group_users)
+    
+
+    # Normalize JSON
+    response_group_users = pd.json_normalize(response_group_users.json()['value'])
+    
+
+    # Define schema
+    schema_workspaces_users = StructType(
+                [StructField("displayName", StringType(), True),
+                StructField("emailAddress", StringType(), True),
+                StructField("groupUserAccessRight",StringType(), True), 
+                StructField("identifier", StringType(), True),
+                StructField("principalType", StringType(), True)])
+
+
+    # Create Spark DataFrame
+    df_group_users = spark.createDataFrame(response_group_users[["displayName", "emailAddress" , "groupUserAccessRight", "identifier", "principalType"]], schema=schema_workspaces_users)
+    
+
+    # Add additional columns to DataFrame
+    df_group_users = df_group_users.withColumn("group_id", lit(group_id))
+    df_group_users = df_group_users.withColumn("todaysDate", current_date())
+
+
+    return df_group_users
+
+
+#############################################
+# Iterate through group IDs and fetch WORKSPACE USERS
+combined_workspaces_users_df = None
+
+for group_id in group_ids:
+   
+    df_workspaces_users = workspaces_users_api(group_id)
+    if df_workspaces_users:
+        if combined_workspaces_users_df is None:
+            combined_workspaces_users_df = df_workspaces_users  # First DataFrame
+        else:
+            combined_workspaces_users_df = combined_workspaces_users_df.union(df_workspaces_users)  # Append to the combined DataFrame
+
+
+# Display the combined DataFrame
+display(combined_workspaces_users_df)
+
+
+
+#############################################
+# Defying function datasets_api
+
+def datasets_api(group_id):
+
+    # Define expected columns
+    expected_cols = ["id", "name", "createdDate", "configuredBy", "webUrl"]
+
+    # Make API call with error handling
+    url_datasets = f"https://api.powerbi.com/v1.0/myorg/groups/{group_id}/datasets"
+
+    try:
+        response_url_datasets = client.get(url_datasets)
+        response_url_datasets.raise_for_status()  # Raises HTTPError for bad responses
+    except Exception as e:
+        print(f"Error fetching datasets for group {group_id}: {e}")
+        return None
+
+    # Parse and clean response
+    raw_data = response_url_datasets.json().get('value', [])
+    cleaned_data = [item for item in raw_data if isinstance(item, dict) and item]
+
+    if not cleaned_data:
+        print(f"No valid datasets found for group {group_id}")
+        return None
+
+    # Normalize JSON
+    response_datasets = pd.json_normalize(cleaned_data)
+
+    # Define schema dynamically
+    schema_datasets = StructType([StructField(col, StringType(), True) for col in expected_cols])
+
+    # Select only available columns
+    available_cols = [col for col in expected_cols if col in response_datasets.columns]
+    df_datasets = spark.createDataFrame(response_datasets[available_cols], schema=schema_datasets)
+
+    # Add additional columns
+    df_datasets = df_datasets.withColumn("group_id", lit(group_id))
+    df_datasets = df_datasets.withColumn("todaysDate", current_date())
+
+    return df_datasets
+
+
+#############################################
+# Iterate through group IDs and fetch DATASETS
+combined_datasets_df = None
+
+for group_id in group_ids:
+   
+    df_datasets = datasets_api(group_id)
+    if df_datasets:
+        if combined_datasets_df is None:
+            combined_datasets_df = df_datasets  # First DataFrame
+        else:
+            combined_datasets_df = combined_datasets_df.union(df_datasets)  # Append to the combined DataFrame
+
+# Display the combined DataFrame
+display(combined_datasets_df)
+
+# Extract group Dataset IDs as a list
+dataset_ids = [row.id for row in combined_datasets_df.collect()]
+
+
+#############################################
+# Defying dataset_users_api
+
+def dataset_users_api(group_id, dataset_id):
+    # Define expected columns
+    expected_cols = ["identifier", "datasetUserAccessRight", "principalType", "groupId", "datasetId"]
+
+    # Make API call with error handling
+    url_users = f"https://api.powerbi.com/v1.0/myorg/groups/{group_id}/datasets/{dataset_id}/users"
+    try:
+        response = client.get(url_users)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"Error fetching users for dataset {dataset_id} in group {group_id}: {e}")
+        return None
+
+    # Parse and clean response
+    raw_data = response.json().get('value', [])
+    cleaned_data = [item for item in raw_data if isinstance(item, dict) and item]
+
+    if not cleaned_data:
+        print(f"No valid users found for dataset {dataset_id} in group {group_id}")
+        return None
+
+    # Normalize JSON
+    response_users = pd.json_normalize(cleaned_data)
+
+    # Ensure metadata columns exist
+    for col in ["groupId", "datasetId"]:
+        if col not in response_users.columns:
+            response_users[col] = None
+
+    response_users["groupId"] = group_id
+    response_users["datasetId"] = dataset_id
+
+    # Define schema dynamically
+    schema_users = StructType([StructField(col, StringType(), True) for col in expected_cols])
+
+    # Select only available columns
+    available_cols = [col for col in expected_cols if col in response_users.columns]
+    df_users = spark.createDataFrame(response_users[available_cols], schema=schema_users)
+
+    # Add additional columns
+    df_users = df_users.withColumn("todaysDate", current_date())
+
+    return df_users
+
+
+
+combined_users_df = None
+
+for group_id in group_ids:
+    df_datasets = datasets_api(group_id)
+    
+    if df_datasets:
+        dataset_ids = [row.id for row in df_datasets.collect()] 
+
+        for dataset_id in dataset_ids:
+            df_users = dataset_users_api(group_id, dataset_id)
+            if df_users:
+                if combined_users_df is None:
+                    combined_users_df = df_users
+                else:
+                    combined_users_df = combined_users_df.union(df_users)
+
+display(combined_users_df)
+
+
+
+#############################################
+# Creating Delta Tables
+
+#Saving df_workspaces
+delta_table_path = "Tables/WorkspacesAPI" #fill in your delta table path 
+df_workspaces.write.format("delta").mode("append").option("mergeSchema", "true").save(delta_table_path)
+
+#Saving df_workspaces_users
+delta_table_path = "Tables/WorkspacesUsersAPI" #fill in your delta table path 
+combined_workspaces_users_df.write.format("delta").mode("append").option("mergeSchema", "true").save(delta_table_path)
+
+#Saving combined_datasets_df
+delta_table_path = "Tables/DatasetsAPI" #fill in your delta table path 
+combined_datasets_df.write.format("delta").mode("append").option("mergeSchema", "true").save(delta_table_path)
+
+#Saving combined_datasets_df
+delta_table_path = "Tables/DatasetsUsersAPI" #fill in your delta table path 
+combined_users_df.write.format("delta").mode("append").option("mergeSchema", "true").save(delta_table_path)
+
